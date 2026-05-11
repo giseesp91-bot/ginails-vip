@@ -1,5 +1,12 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
+import { auth, db, googleProvider } from './firebase';
+import {
+  signInWithPopup, signOut, onAuthStateChanged, type User
+} from 'firebase/auth';
+import {
+  doc, getDoc, setDoc, deleteDoc, collection, getDocs, writeBatch
+} from 'firebase/firestore';
 import {
   Plus, Search, Settings, Moon, Sun, Trash2, Edit3, Share2, Download,
   QrCode, Sparkles, Heart, Gem, Leaf, Droplet, Star, Flower2, Award,
@@ -245,6 +252,27 @@ interface StorageAdapter {
   loadSettings(): Promise<Settings | null>;
   saveSettings(settings: Settings): Promise<void>;
 }
+// Recursively strip undefined values from an object/array.
+// Firestore rejects `undefined` as a field value, but JavaScript objects
+// often have undefined for optional fields (e.g. phone, notes, photo).
+// This converts them to "field omitted" before saving.
+function stripUndefined<T>(obj: T): T {
+  if (obj === null || obj === undefined) return obj;
+  if (Array.isArray(obj)) {
+    return obj.map(stripUndefined) as any;
+  }
+  if (typeof obj === 'object') {
+    const out: any = {};
+    for (const key of Object.keys(obj as any)) {
+      const val = (obj as any)[key];
+      if (val !== undefined) {
+        out[key] = stripUndefined(val);
+      }
+    }
+    return out;
+  }
+  return obj;
+}
 
 class LocalStorageAdapter implements StorageAdapter {
   async loadClients(): Promise<Client[]> {
@@ -264,6 +292,67 @@ class LocalStorageAdapter implements StorageAdapter {
   }
   async saveSettings(settings: Settings): Promise<void> {
     try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings)); } catch {}
+  }
+}
+// ─── FirebaseAdapter — production persistence with multi-device sync ───
+// Each user (Google account) gets their own isolated namespace in Firestore.
+// Data lives at: usuarios/{uid}/vip_clientas/* and usuarios/{uid}/vip_settings/main
+//
+// To swap from local-only to cloud-synced, just instantiate this adapter
+// instead of LocalStorageAdapter. The rest of the app doesn't change.
+//
+class FirebaseAdapter implements StorageAdapter {
+  constructor(private uid: string) {}
+
+  private clientsCol() {
+    return collection(db, 'usuarios', this.uid, 'vip_clientas');
+  }
+  private settingsDoc() {
+    return doc(db, 'usuarios', this.uid, 'vip_settings', 'main');
+  }
+
+  async loadClients(): Promise<Client[]> {
+    try {
+      const snap = await getDocs(this.clientsCol());
+      return snap.docs.map(d => d.data() as Client);
+    } catch (err) {
+      console.error('FirebaseAdapter.loadClients', err);
+      return [];
+    }
+  }
+
+  async saveClients(clients: Client[]): Promise<void> {
+    try {
+      const batch = writeBatch(db);
+      const existing = await getDocs(this.clientsCol());
+      existing.forEach(d => batch.delete(d.ref));
+      clients.forEach(c => {
+        const ref = doc(db, 'usuarios', this.uid, 'vip_clientas', c.id);
+        // Firestore rejects `undefined` values. Strip them recursively before saving.
+        batch.set(ref, stripUndefined(c));
+      });
+      await batch.commit();
+    } catch (err) {
+      console.error('FirebaseAdapter.saveClients', err);
+    }
+  }
+
+  async loadSettings(): Promise<Settings | null> {
+    try {
+      const snap = await getDoc(this.settingsDoc());
+      return snap.exists() ? (snap.data() as Settings) : null;
+    } catch (err) {
+      console.error('FirebaseAdapter.loadSettings', err);
+      return null;
+    }
+  }
+
+  async saveSettings(settings: Settings): Promise<void> {
+    try {
+      await setDoc(this.settingsDoc(), stripUndefined(settings));
+    } catch (err) {
+      console.error('FirebaseAdapter.saveSettings', err);
+    }
   }
 }
 
@@ -1415,7 +1504,131 @@ const VIPCard: React.FC<{
 //     tenantId: 'studio-cordoba-001',
 //   }} />
 //
-export default function GinailsVIP({ config }: { config?: VIPModuleConfig } = {}) {
+// ═══════════════════════════════════════════════════════════════════
+// LOGIN SCREEN — Google sign-in gate
+// ═══════════════════════════════════════════════════════════════════
+const LoginScreen: React.FC = () => {
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  // Inject Google Fonts for the login screen too
+  useEffect(() => {
+    const link = document.createElement('link');
+    link.rel = 'stylesheet';
+    link.href = 'https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,400;0,500;0,600;0,700;1,400;1,600;1,700&family=Outfit:wght@300;400;500;600;700&display=swap';
+    document.head.appendChild(link);
+    return () => { document.head.removeChild(link); };
+  }, []);
+
+  const handleLogin = async () => {
+    setError(null);
+    setLoading(true);
+    try {
+      await signInWithPopup(auth, googleProvider);
+      // onAuthStateChanged in the root component will pick this up
+    } catch (err: any) {
+      console.error('Login error', err);
+      setError(err?.message || 'No se pudo iniciar sesión');
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div
+      className="min-h-screen w-full flex items-center justify-center p-6"
+      style={{
+        background: 'radial-gradient(ellipse at top, #FDF6F3 0%, #F5F0EC 50%, #EFEAE4 100%)',
+        fontFamily: '"Outfit", system-ui, sans-serif',
+      }}
+    >
+      {/* Atmospheric blobs */}
+      <div className="fixed inset-0 pointer-events-none overflow-hidden" style={{ zIndex: 0 }}>
+        <div className="absolute -top-40 -right-40 w-96 h-96 rounded-full opacity-30 blur-3xl"
+          style={{ background: 'radial-gradient(circle, #E8B4C0 0%, transparent 70%)' }} />
+        <div className="absolute -bottom-40 -left-40 w-96 h-96 rounded-full opacity-25 blur-3xl"
+          style={{ background: 'radial-gradient(circle, #B8C9A8 0%, transparent 70%)' }} />
+      </div>
+
+      <motion.div
+        initial={{ opacity: 0, y: 20 }}
+        animate={{ opacity: 1, y: 0 }}
+        transition={{ duration: 0.6 }}
+        className="relative z-10 w-full max-w-md text-center"
+      >
+        <div className="mb-8">
+          <div
+            className="text-5xl sm:text-6xl leading-none mb-2"
+            style={{
+              fontFamily: '"Cormorant Garamond", serif',
+              fontStyle: 'italic',
+              fontWeight: 700,
+              background: 'linear-gradient(135deg, #D4AF7F 0%, #C98AA0 50%, #8FA378 100%)',
+              WebkitBackgroundClip: 'text',
+              backgroundClip: 'text',
+              color: 'transparent',
+            }}
+          >
+            Ginails VIP
+          </div>
+          <div className="text-[11px] tracking-[0.35em] uppercase opacity-60">
+            Loyalty · Premium
+          </div>
+        </div>
+
+        <div
+          className="rounded-3xl p-8 mb-4"
+          style={{
+            background: 'rgba(255,255,255,0.75)',
+            backdropFilter: 'blur(20px)',
+            border: '1px solid rgba(212,175,127,0.25)',
+            boxShadow: '0 20px 60px rgba(201,138,160,0.15)',
+          }}
+        >
+          <p className="text-sm opacity-75 mb-6 leading-relaxed">
+            Ingresá con tu cuenta de Google para empezar a fidelizar a tus clientas
+            con tarjetas digitales premium.
+          </p>
+
+          <button
+            onClick={handleLogin}
+            disabled={loading}
+            className="w-full py-3.5 rounded-2xl font-medium tracking-wide flex items-center justify-center gap-3 transition-all hover:scale-[1.02] active:scale-95 disabled:opacity-60 disabled:cursor-not-allowed"
+            style={{
+              background: 'linear-gradient(135deg, #D4AF7F 0%, #C98AA0 100%)',
+              color: '#fff',
+              boxShadow: '0 10px 30px rgba(201,138,160,0.4)',
+            }}
+          >
+            {loading ? (
+              'Conectando…'
+            ) : (
+              <>
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none">
+                  <path d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z" fill="#fff"/>
+                  <path d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z" fill="#fff" opacity="0.9"/>
+                  <path d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z" fill="#fff" opacity="0.8"/>
+                  <path d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z" fill="#fff" opacity="0.95"/>
+                </svg>
+                Ingresar con Google
+              </>
+            )}
+          </button>
+
+          {error && (
+            <p className="text-xs mt-3" style={{ color: '#c14' }}>
+              {error}
+            </p>
+          )}
+        </div>
+
+        <p className="text-[10px] tracking-widest uppercase opacity-50">
+          Tus datos se sincronizan en todos tus dispositivos
+        </p>
+      </motion.div>
+    </div>
+  );
+};
+function GinailsVIPApp({ config }: { config?: VIPModuleConfig } = {}) {
   // ─── State from the modular hook (single integration point) ───
   const { clients, settings, setSettings, themes, actions } = useVIPModule(config);
 
@@ -3915,3 +4128,87 @@ const ClientModal: React.FC<{
     </Modal>
   );
 };
+// ═══════════════════════════════════════════════════════════════════
+// ROOT EXPORT — Auth wrapper that decides login vs app
+// ═══════════════════════════════════════════════════════════════════
+// This is the actual export. It handles the auth lifecycle:
+//   - If no user is logged in → show LoginScreen
+//   - If logged in → mount the app with a FirebaseAdapter scoped to their UID
+//   - Loading state while Firebase is checking the session
+//
+export default function GinailsVIP() {
+  const [user, setUser] = useState<User | null>(null);
+  const [authLoading, setAuthLoading] = useState(true);
+
+  // Listen to auth state changes (login, logout, session restore on reload)
+  useEffect(() => {
+    const unsubscribe = onAuthStateChanged(auth, (u) => {
+      setUser(u);
+      setAuthLoading(false);
+    });
+    return () => unsubscribe();
+  }, []);
+
+  // Build the Firebase-backed config — only when we have a user
+  const firebaseConfig = useMemo<VIPModuleConfig | undefined>(() => {
+    if (!user) return undefined;
+    return {
+      storageAdapter: new FirebaseAdapter(user.uid),
+      tenantId: user.uid,
+    };
+  }, [user]);
+
+  // ── Loading state ──
+  if (authLoading) {
+    return (
+      <div
+        className="min-h-screen w-full flex items-center justify-center"
+        style={{
+          background: 'radial-gradient(ellipse at top, #FDF6F3 0%, #F5F0EC 50%, #EFEAE4 100%)',
+          fontFamily: '"Outfit", system-ui, sans-serif',
+        }}
+      >
+        <div className="text-center">
+          <div
+            className="text-3xl mb-2"
+            style={{
+              fontFamily: '"Cormorant Garamond", serif',
+              fontStyle: 'italic',
+              fontWeight: 700,
+              background: 'linear-gradient(135deg, #D4AF7F 0%, #C98AA0 50%, #8FA378 100%)',
+              WebkitBackgroundClip: 'text',
+              backgroundClip: 'text',
+              color: 'transparent',
+            }}
+          >
+            Ginails VIP
+          </div>
+          <div className="text-xs tracking-widest uppercase opacity-50">Cargando…</div>
+        </div>
+      </div>
+    );
+  }
+
+  // ── Not logged in → show login ──
+  if (!user) {
+    return <LoginScreen />;
+  }
+
+  // ── Logged in → mount the app with Firebase persistence ──
+  return (
+    <>
+      <GinailsVIPApp config={firebaseConfig} />
+      {/* Tiny logout button in the corner — non-intrusive */}
+      <button
+        onClick={() => signOut(auth)}
+        className="fixed bottom-3 left-3 z-50 text-[9px] tracking-widest uppercase opacity-30 hover:opacity-80 transition-opacity px-2 py-1 rounded"
+        style={{
+          background: 'rgba(255,255,255,0.5)',
+          backdropFilter: 'blur(8px)',
+        }}
+      >
+        Cerrar sesión
+      </button>
+    </>
+  );
+}
