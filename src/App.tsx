@@ -1884,10 +1884,11 @@ function GinailsVIPApp({ config }: { config?: VIPModuleConfig } = {}) {
   };
 
   // ─── WhatsApp share via shareService ───
-  const shareWhatsApp = () => {
+const shareWhatsApp = () => {
     if (!activeClient) return;
     const cfg = settings[activeClient.brand];
-    const msg = shareService.whatsappMessage(activeClient, cfg.businessName, cfg.rewardText);
+    const publicUrl = `https://ginails-vip.pages.dev/c/${activeClient.tenantId || ''}/${activeClient.id}`;
+    const msg = shareService.cardShareMessage(activeClient, cfg.businessName, cfg.rewardText, publicUrl);
     const url = shareService.whatsappUrl(activeClient, msg);
     window.open(url, '_blank');
   };
