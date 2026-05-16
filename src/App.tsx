@@ -251,7 +251,10 @@ interface StorageAdapter {
   saveClients(clients: Client[]): Promise<void>;
   loadSettings(): Promise<Settings | null>;
   saveSettings(settings: Settings): Promise<void>;
+  // Optional: read a single client by ID (used by the public QR view)
+  loadClientById?(id: string): Promise<Client | null>;
 }
+
 // Recursively strip undefined values from an object/array.
 // Firestore rejects `undefined` as a field value, but JavaScript objects
 // often have undefined for optional fields (e.g. phone, notes, photo).
@@ -294,13 +297,10 @@ class LocalStorageAdapter implements StorageAdapter {
     try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings)); } catch {}
   }
 }
+
 // ─── FirebaseAdapter — production persistence with multi-device sync ───
 // Each user (Google account) gets their own isolated namespace in Firestore.
 // Data lives at: usuarios/{uid}/vip_clientas/* and usuarios/{uid}/vip_settings/main
-//
-// To swap from local-only to cloud-synced, just instantiate this adapter
-// instead of LocalStorageAdapter. The rest of the app doesn't change.
-//
 class FirebaseAdapter implements StorageAdapter {
   constructor(private uid: string) {}
 
@@ -354,24 +354,31 @@ class FirebaseAdapter implements StorageAdapter {
       console.error('FirebaseAdapter.saveSettings', err);
     }
   }
-}
 
-// Reference skeleton for a future Firebase adapter — uncomment & wire up later
-//
-// class FirebaseAdapter implements StorageAdapter {
-//   constructor(private firestore: any, private userPath: string) {}
-//   async loadClients() {
-//     const snap = await this.firestore.collection(`${this.userPath}/clients`).get();
-//     return snap.docs.map((d: any) => d.data());
-//   }
-//   async saveClients(clients: Client[]) {
-//     const batch = this.firestore.batch();
-//     clients.forEach(c => batch.set(this.firestore.doc(`${this.userPath}/clients/${c.id}`), c));
-//     await batch.commit();
-//   }
-//   async loadSettings() { /* ... */ return null; }
-//   async saveSettings(s: Settings) { /* ... */ }
-// }
+  // Public read-only lookup by UID/ID combo. Used by the public card view.
+  // Path: usuarios/{ownerUid}/vip_clientas/{clientId}
+  static async loadPublicCard(ownerUid: string, clientId: string): Promise<Client | null> {
+    try {
+      const ref = doc(db, 'usuarios', ownerUid, 'vip_clientas', clientId);
+      const snap = await getDoc(ref);
+      return snap.exists() ? (snap.data() as Client) : null;
+    } catch (err) {
+      console.error('FirebaseAdapter.loadPublicCard', err);
+      return null;
+    }
+  }
+
+  static async loadPublicSettings(ownerUid: string): Promise<Settings | null> {
+    try {
+      const ref = doc(db, 'usuarios', ownerUid, 'vip_settings', 'main');
+      const snap = await getDoc(ref);
+      return snap.exists() ? (snap.data() as Settings) : null;
+    } catch (err) {
+      console.error('FirebaseAdapter.loadPublicSettings', err);
+      return null;
+    }
+  }
+}
 
 // ═══════════════════════════════════════════════════════════════════
 // 4. SERVICES — Pure business logic, no React, no DOM
@@ -551,6 +558,116 @@ const shareService = {
       new Date(c.createdAt).toLocaleDateString('es-AR'),
     ]);
     return [headers, ...rows].map(r => r.map(v => `"${v}"`).join(',')).join('\n');
+  },
+
+  // ─── Card-share message (used together with the rendered image) ───
+  // Returns a warm, elegant message tailored to the client's progress.
+  // Used by the "Enviar tarjeta" flow that shares the image + this text.
+  cardShareMessage(client: Client, businessName: string, rewardText: string, publicUrl?: string): string {
+    const firstName = client.name.split(' ')[0];
+    const completed = client.visits.length;
+    const remaining = clientService.remainingVisits(client);
+    const isComplete = clientService.isComplete(client);
+    const linkLine = publicUrl ? `\n\nMirá tu tarjeta acá: ${publicUrl}` : '';
+
+    if (isComplete && !client.rewardClaimed) {
+      return `💖 ¡${firstName}! Tu tarjeta VIP en ${businessName} está completa ✨\nTe ganaste tu premio: ${rewardText} 🎁${linkLine}`;
+    }
+    if (isComplete && client.rewardClaimed) {
+      return `💖 Así va tu tarjeta VIP en ${businessName} ${firstName} ✨\n¡Premio entregado! Gracias por ser parte 💖${linkLine}`;
+    }
+    if (remaining === 1) {
+      return `💖 Así va tu tarjeta VIP actualizada en ${businessName} ✨\nLlevás ${completed} visitas y te falta solo 1 para tu premio 🎁${linkLine}`;
+    }
+    return `💖 Así va tu tarjeta VIP actualizada en ${businessName} ✨\nYa llevás ${completed} visitas y estás cada vez más cerca de tu premio 🎁${linkLine}`;
+  },
+
+  // ─── Capability detection — can this device share files natively? ───
+  canShareFiles(): boolean {
+    try {
+      if (typeof navigator === 'undefined' || !navigator.share || !navigator.canShare) return false;
+      // Probe with a dummy 1-byte file
+      const probe = new File(['x'], 'probe.png', { type: 'image/png' });
+      return navigator.canShare({ files: [probe] });
+    } catch {
+      return false;
+    }
+  },
+};
+
+// ─── cardRenderService — turn the card DOM node into a PNG blob ───
+// Uses html2canvas under the hood, lazy-loaded so it doesn't bloat the
+// initial bundle. Returns a Blob ready to share or download.
+//
+const cardRenderService = {
+  async renderToBlob(cardNode: HTMLElement, scale = 3): Promise<Blob | null> {
+    try {
+      const html2canvas = (await import('https://esm.sh/html2canvas-pro@1.5.8' as any)).default;
+      const canvas = await html2canvas(cardNode, {
+        backgroundColor: null,
+        scale,
+        useCORS: true,
+      });
+      return await new Promise<Blob | null>((resolve) => {
+        canvas.toBlob((b: Blob | null) => resolve(b), 'image/png');
+      });
+    } catch (err) {
+      console.error('cardRenderService.renderToBlob', err);
+      return null;
+    }
+  },
+
+  // ─── Share strategies, in priority order ───
+
+  // Strategy A: Native share with file attached (iOS/Android share sheet).
+  // The user picks WhatsApp from the OS share sheet and the image + text
+  // arrive pre-loaded in the chat.
+  async shareNativeWithFile(blob: Blob, fileName: string, text: string): Promise<boolean> {
+    try {
+      if (!shareService.canShareFiles()) return false;
+      const file = new File([blob], fileName, { type: 'image/png' });
+      await navigator.share({ files: [file], text });
+      return true;
+    } catch (err: any) {
+      // User cancelled → treat as success (no fallback)
+      if (err?.name === 'AbortError') return true;
+      console.warn('shareNativeWithFile failed, will fall back', err);
+      return false;
+    }
+  },
+
+  // Strategy B: Native share with text only (no file). Used on devices that
+  // support navigator.share but not file sharing.
+  async shareNativeTextOnly(text: string): Promise<boolean> {
+    try {
+      if (typeof navigator === 'undefined' || !navigator.share) return false;
+      await navigator.share({ text });
+      return true;
+    } catch (err: any) {
+      if (err?.name === 'AbortError') return true;
+      return false;
+    }
+  },
+
+  // Strategy C: Download the image + open WhatsApp Web with the text.
+  // The user has to attach the just-downloaded image manually.
+  downloadAndOpenWhatsapp(blob: Blob, fileName: string, text: string, phone?: string): void {
+    // Trigger download
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = fileName;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 5_000);
+
+    // Open WhatsApp with the message
+    const cleanPhone = (phone || '').replace(/\D/g, '');
+    const waUrl = cleanPhone
+      ? `https://wa.me/${cleanPhone}?text=${encodeURIComponent(text)}`
+      : `https://wa.me/?text=${encodeURIComponent(text)}`;
+    window.open(waUrl, '_blank');
   },
 };
 
@@ -1525,7 +1642,6 @@ const LoginScreen: React.FC = () => {
     setLoading(true);
     try {
       await signInWithPopup(auth, googleProvider);
-      // onAuthStateChanged in the root component will pick this up
     } catch (err: any) {
       console.error('Login error', err);
       setError(err?.message || 'No se pudo iniciar sesión');
@@ -1541,7 +1657,6 @@ const LoginScreen: React.FC = () => {
         fontFamily: '"Outfit", system-ui, sans-serif',
       }}
     >
-      {/* Atmospheric blobs */}
       <div className="fixed inset-0 pointer-events-none overflow-hidden" style={{ zIndex: 0 }}>
         <div className="absolute -top-40 -right-40 w-96 h-96 rounded-full opacity-30 blur-3xl"
           style={{ background: 'radial-gradient(circle, #E8B4C0 0%, transparent 70%)' }} />
@@ -1628,6 +1743,7 @@ const LoginScreen: React.FC = () => {
     </div>
   );
 };
+
 function GinailsVIPApp({ config }: { config?: VIPModuleConfig } = {}) {
   // ─── State from the modular hook (single integration point) ───
   const { clients, settings, setSettings, themes, actions } = useVIPModule(config);
@@ -1728,27 +1844,42 @@ function GinailsVIPApp({ config }: { config?: VIPModuleConfig } = {}) {
     URL.revokeObjectURL(url);
   };
 
-  // ─── Share card as image (UI-side, needs DOM access) ───
-  const shareCardAsImage = async () => {
-    if (!cardRef.current || !activeClient) return;
+  // ─── Share card flow: render → try native share → fallback to download+WA ───
+  // Mobile-first: on iOS/Android the OS share sheet lets the user pick WhatsApp
+  // and the image arrives pre-attached in the chat. On desktop, the image
+  // downloads and WhatsApp Web opens with the message ready to send.
+  const [sharingCard, setSharingCard] = useState(false);
+
+  const shareCard = async () => {
+    if (!cardRef.current || !activeClient || sharingCard) return;
+    setSharingCard(true);
     try {
-      const html2canvas = (await import('https://esm.sh/html2canvas-pro@1.5.8' as any)).default;
-      const canvas = await html2canvas(cardRef.current, {
-        backgroundColor: null,
-        scale: 3,
-        useCORS: true,
-      });
-      canvas.toBlob(async (blob: Blob | null) => {
-        if (!blob) return;
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = `${activeClient.name}-tarjeta-vip.png`;
-        a.click();
-        URL.revokeObjectURL(url);
-      });
-    } catch (e) {
-      alert('Para descargar la imagen, usa la captura de pantalla del celular. (Función avanzada cargando…)');
+      const cfg = settings[activeClient.brand];
+      const publicUrl = `https://ginails-vip.pages.dev/c/${activeClient.id}`;
+      const message = shareService.cardShareMessage(activeClient, cfg.businessName, cfg.rewardText, publicUrl);
+      const fileName = `${activeClient.name.replace(/\s+/g, '-').toLowerCase()}-tarjeta-vip.png`;
+
+      // Render the card to a PNG blob
+      const blob = await cardRenderService.renderToBlob(cardRef.current);
+      if (!blob) {
+        alert('No se pudo generar la imagen. Probá de nuevo.');
+        return;
+      }
+
+      // Strategy A: native share with file (best on mobile)
+      if (shareService.canShareFiles()) {
+        const ok = await cardRenderService.shareNativeWithFile(blob, fileName, message);
+        if (ok) return;
+      }
+
+      // Strategy B (fallback for desktop / unsupported browsers):
+      // download the image AND open WhatsApp Web with the message pre-loaded
+      cardRenderService.downloadAndOpenWhatsapp(blob, fileName, message, activeClient.phone);
+    } catch (err) {
+      console.error('shareCard error', err);
+      alert('Hubo un problema al compartir la tarjeta. Probá de nuevo.');
+    } finally {
+      setSharingCard(false);
     }
   };
 
@@ -2127,9 +2258,14 @@ function GinailsVIPApp({ config }: { config?: VIPModuleConfig } = {}) {
                     label="Visita anterior"
                   />
                 )}
-                <ActionBtn dark={dark} onClick={shareWhatsApp} icon={Share2} label="WhatsApp" />
+                <ActionBtn dark={dark} onClick={shareWhatsApp} icon={MessageCircle} label="Mensaje" />
                 <ActionBtn dark={dark} onClick={() => setShowQRModal(true)} icon={QrCode} label="QR Code" />
-                <ActionBtn dark={dark} onClick={shareCardAsImage} icon={Download} label="Descargar" />
+                <ActionBtn
+                  dark={dark}
+                  onClick={shareCard}
+                  icon={Share2}
+                  label={sharingCard ? 'Enviando…' : 'Enviar tarjeta'}
+                />
                 <ActionBtn dark={dark} onClick={() => { setEditingClient(activeClient); setShowAddModal(true); }} icon={Edit3} label="Editar" />
                 <ActionBtn dark={dark} onClick={() => deleteClient(activeClient.id)} icon={Trash2} label="Eliminar" danger />
               </div>
@@ -4128,15 +4264,259 @@ const ClientModal: React.FC<{
     </Modal>
   );
 };
+
+// ═══════════════════════════════════════════════════════════════════
+// PUBLIC CARD VIEW — read-only view of a client's VIP card (for QR/link)
+// ═══════════════════════════════════════════════════════════════════
+// Reached via /c/{ownerUid}/{clientId} — accessible without login.
+// Reads the card and the owner's brand settings directly from Firestore
+// using the public read rules. No personal data is exposed beyond what's
+// already on the card (name, visits, progress).
+//
+const PublicCardView: React.FC<{ ownerUid: string; clientId: string }> = ({ ownerUid, clientId }) => {
+  const [client, setClient] = useState<Client | null>(null);
+  const [settings, setSettings] = useState<Settings | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [notFound, setNotFound] = useState(false);
+
+  // Inject Google Fonts
+  useEffect(() => {
+    const link = document.createElement('link');
+    link.rel = 'stylesheet';
+    link.href = 'https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,400;0,500;0,600;0,700;1,400;1,600;1,700&family=Outfit:wght@300;400;500;600;700&display=swap';
+    document.head.appendChild(link);
+    return () => { document.head.removeChild(link); };
+  }, []);
+
+  // Load card + settings from Firestore (public read)
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      const [card, raw] = await Promise.all([
+        FirebaseAdapter.loadPublicCard(ownerUid, clientId),
+        FirebaseAdapter.loadPublicSettings(ownerUid),
+      ]);
+      if (!alive) return;
+      if (!card) {
+        setNotFound(true);
+        setLoading(false);
+        return;
+      }
+      setClient(card);
+      setSettings(raw ? settingsService.migrate(raw) : settingsService.defaults());
+      setLoading(false);
+    })();
+    return () => { alive = false; };
+  }, [ownerUid, clientId]);
+
+  // ─── Loading state ───
+  if (loading) {
+    return (
+      <div
+        className="min-h-screen w-full flex items-center justify-center"
+        style={{
+          background: 'radial-gradient(ellipse at top, #FDF6F3 0%, #F5F0EC 50%, #EFEAE4 100%)',
+          fontFamily: '"Outfit", system-ui, sans-serif',
+        }}
+      >
+        <div className="text-center">
+          <div
+            className="text-3xl mb-2"
+            style={{
+              fontFamily: '"Cormorant Garamond", serif',
+              fontStyle: 'italic',
+              fontWeight: 700,
+              background: 'linear-gradient(135deg, #D4AF7F 0%, #C98AA0 50%, #8FA378 100%)',
+              WebkitBackgroundClip: 'text',
+              backgroundClip: 'text',
+              color: 'transparent',
+            }}
+          >
+            Cargando tu tarjeta…
+          </div>
+          <div className="text-xs tracking-widest uppercase opacity-50">Un momento</div>
+        </div>
+      </div>
+    );
+  }
+
+  // ─── Not found state ───
+  if (notFound || !client || !settings) {
+    return (
+      <div
+        className="min-h-screen w-full flex items-center justify-center p-6"
+        style={{
+          background: 'radial-gradient(ellipse at top, #FDF6F3 0%, #F5F0EC 50%, #EFEAE4 100%)',
+          fontFamily: '"Outfit", system-ui, sans-serif',
+        }}
+      >
+        <div className="text-center max-w-md">
+          <div
+            className="text-3xl mb-2"
+            style={{
+              fontFamily: '"Cormorant Garamond", serif',
+              fontStyle: 'italic',
+              fontWeight: 700,
+              color: '#C98AA0',
+            }}
+          >
+            Tarjeta no encontrada
+          </div>
+          <p className="text-sm opacity-70 mt-3">
+            El link puede estar incorrecto o la tarjeta ya no existe. Pedile a tu profesional un link actualizado.
+          </p>
+        </div>
+      </div>
+    );
+  }
+
+  // ─── Card display ───
+  const cfg = settings[client.brand];
+  const theme = themeService.build(cfg, client.brand);
+  const completed = client.visits.length;
+  const remaining = clientService.remainingVisits(client);
+  const isComplete = clientService.isComplete(client);
+  const businessName = cfg.businessName;
+  const rewardText = cfg.rewardText;
+
+  return (
+    <div
+      className="min-h-screen w-full"
+      style={{
+        background: 'radial-gradient(ellipse at top, #FDF6F3 0%, #F5F0EC 50%, #EFEAE4 100%)',
+        fontFamily: '"Outfit", system-ui, sans-serif',
+      }}
+    >
+      <div className="fixed inset-0 pointer-events-none overflow-hidden" style={{ zIndex: 0 }}>
+        <div className="absolute -top-40 -right-40 w-96 h-96 rounded-full opacity-30 blur-3xl"
+          style={{ background: `radial-gradient(circle, ${theme.primary} 0%, transparent 70%)` }} />
+        <div className="absolute -bottom-40 -left-40 w-96 h-96 rounded-full opacity-25 blur-3xl"
+          style={{ background: `radial-gradient(circle, ${theme.accent} 0%, transparent 70%)` }} />
+      </div>
+
+      <div className="relative z-10 max-w-md mx-auto px-4 py-10 sm:py-16">
+        <div className="text-center mb-8">
+          {cfg.logo && (
+            <div
+              className="w-20 h-20 rounded-full overflow-hidden mx-auto mb-3"
+              style={{
+                border: `1.5px solid ${theme.accent}`,
+                background: '#fff',
+                boxShadow: `0 8px 24px ${theme.accent}44`,
+              }}
+            >
+              <img src={cfg.logo} alt={businessName} className="w-full h-full object-cover" />
+            </div>
+          )}
+          <div
+            className="text-3xl leading-none mb-1"
+            style={{
+              fontFamily: '"Cormorant Garamond", serif',
+              fontStyle: 'italic',
+              fontWeight: 700,
+              background: theme.foil,
+              WebkitBackgroundClip: 'text',
+              backgroundClip: 'text',
+              color: 'transparent',
+            }}
+          >
+            {businessName}
+          </div>
+          {settings.cardSubtitle && (
+            <div className="text-[10px] tracking-[0.3em] uppercase opacity-60 mt-1">
+              {settings.cardSubtitle}
+            </div>
+          )}
+        </div>
+
+        <motion.div
+          initial={{ opacity: 0, y: 20 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ duration: 0.5 }}
+        >
+          <VIPCard
+            client={client}
+            businessName={businessName}
+            rewardText={rewardText}
+            logo={cfg.logo}
+            theme={theme}
+            customStamps={settings.customStamps || []}
+            cardSubtitle={settings.cardSubtitle}
+          />
+        </motion.div>
+
+        <motion.div
+          initial={{ opacity: 0 }}
+          animate={{ opacity: 1 }}
+          transition={{ delay: 0.3, duration: 0.5 }}
+          className="mt-8 text-center"
+        >
+          {isComplete && !client.rewardClaimed && (
+            <div
+              className="rounded-3xl p-5"
+              style={{
+                background: 'rgba(255,255,255,0.7)',
+                backdropFilter: 'blur(20px)',
+                border: `1px solid ${theme.accent}44`,
+              }}
+            >
+              <div className="text-2xl mb-2" style={{ fontFamily: '"Cormorant Garamond", serif', fontStyle: 'italic', fontWeight: 700, color: theme.primaryDark }}>
+                ✨ ¡Premio desbloqueado! ✨
+              </div>
+              <div className="text-sm opacity-80">{rewardText}</div>
+            </div>
+          )}
+
+          {isComplete && client.rewardClaimed && (
+            <div className="text-sm opacity-70">
+              <span style={{ fontFamily: '"Cormorant Garamond", serif', fontStyle: 'italic', fontSize: '1.15rem' }}>
+                ¡Gracias por ser parte de {businessName}! 💖
+              </span>
+            </div>
+          )}
+
+          {!isComplete && (
+            <div className="text-sm opacity-80">
+              <span style={{ fontFamily: '"Cormorant Garamond", serif', fontStyle: 'italic', fontSize: '1.2rem' }}>
+                {remaining === 1
+                  ? `¡Te falta solo 1 visita para tu premio! 🎁`
+                  : `Te faltan ${remaining} visitas para tu premio 🎁`}
+              </span>
+            </div>
+          )}
+        </motion.div>
+
+        <div className="mt-12 text-center text-[10px] tracking-[0.25em] uppercase opacity-40">
+          Tarjeta VIP digital · {businessName}
+        </div>
+      </div>
+    </div>
+  );
+};
+
+// ─── Tiny router helper — read URL and decide which view to mount ───
+// Looks for /c/{ownerUid}/{clientId} pattern. Everything else falls through
+// to the main app (login or dashboard).
+function parsePublicCardRoute(): { ownerUid: string; clientId: string } | null {
+  if (typeof window === 'undefined') return null;
+  const path = window.location.pathname;
+  const match = path.match(/^\/c\/([^/]+)\/([^/]+)\/?$/);
+  if (!match) return null;
+  return { ownerUid: match[1], clientId: match[2] };
+}
+
 // ═══════════════════════════════════════════════════════════════════
 // ROOT EXPORT — Auth wrapper that decides login vs app
 // ═══════════════════════════════════════════════════════════════════
 // This is the actual export. It handles the auth lifecycle:
+//   - If the URL is a public card route → show PublicCardView (no auth needed)
 //   - If no user is logged in → show LoginScreen
 //   - If logged in → mount the app with a FirebaseAdapter scoped to their UID
-//   - Loading state while Firebase is checking the session
 //
 export default function GinailsVIP() {
+  // Public card route check — runs before anything else.
+  const publicRoute = useMemo(() => parsePublicCardRoute(), []);
+
   const [user, setUser] = useState<User | null>(null);
   const [authLoading, setAuthLoading] = useState(true);
 
@@ -4157,6 +4537,11 @@ export default function GinailsVIP() {
       tenantId: user.uid,
     };
   }, [user]);
+
+  // If this is a public card route, render the viewer regardless of auth state
+  if (publicRoute) {
+    return <PublicCardView ownerUid={publicRoute.ownerUid} clientId={publicRoute.clientId} />;
+  }
 
   // ── Loading state ──
   if (authLoading) {
