@@ -109,6 +109,14 @@ interface CustomStamp {
   createdAt: string;
 }
 
+// Un ciclo completado — se guarda cuando la clienta termina la tarjeta y empieza de nuevo
+interface CompletedCycle {
+  cycleNumber: number;      // 1, 2, 3...
+  completedAt: string;      // ISO date cuando se marcó el premio como entregado
+  rewardText: string;       // el premio que recibió (guardado en el momento)
+  visitsCount: number;      // cuántas visitas tenía ese ciclo
+}
+
 interface Client {
   id: string;
   name: string;
@@ -123,6 +131,8 @@ interface Client {
   visits: Visit[];
   rewardClaimed: boolean;
   createdAt: string;
+  // Historial de ciclos completados (se acumula con cada "Nuevo ciclo")
+  completedCycles?: CompletedCycle[];
   // Hook for future integration: external client ID from the parent CRM
   externalId?: string;
   // Hook: which sub-tenant in a multi-business deployment
@@ -454,6 +464,24 @@ const visitService = {
   },
   toggleRewardClaimed(client: Client): Client {
     return { ...client, rewardClaimed: !client.rewardClaimed };
+  },
+
+  // Inicia un nuevo ciclo: guarda el ciclo actual en el historial y resetea visitas/premio.
+  // Llamar solo cuando rewardClaimed === true (ya se entregó el premio).
+  startNewCycle(client: Client, rewardText: string): Client {
+    const prevCycles = client.completedCycles || [];
+    const newCycle: CompletedCycle = {
+      cycleNumber: prevCycles.length + 1,
+      completedAt: new Date().toISOString(),
+      rewardText,
+      visitsCount: client.visits.length,
+    };
+    return {
+      ...client,
+      visits: [],
+      rewardClaimed: false,
+      completedCycles: [...prevCycles, newCycle],
+    };
   },
 };
 
@@ -1295,6 +1323,13 @@ function useVIPModule(config?: VIPModuleConfig) {
         return updated;
       }));
     },
+    startNewCycle: (clientId: string, rewardText: string) => {
+      if (readOnly) return;
+      setClients(prev => prev.map(c => {
+        if (c.id !== clientId) return c;
+        return visitService.startNewCycle(c, rewardText);
+      }));
+    },
     updateSettings: (patch: Partial<Settings> | ((s: Settings) => Settings)) => {
       if (readOnly) return;
       setSettings(prev => typeof patch === 'function' ? patch(prev) : { ...prev, ...patch });
@@ -1863,6 +1898,11 @@ function GinailsVIPApp({ config }: { config?: VIPModuleConfig } = {}) {
   const removeVisitAt = (clientId: string, index: number) =>
     actions.removeVisitAt(clientId, index);
   const toggleRewardClaimed = (clientId: string) => actions.toggleRewardClaimed(clientId);
+  const startNewCycle = (clientId: string) => {
+    if (!activeClient) return;
+    const rewardText = settings[activeClient.brand].rewardText;
+    actions.startNewCycle(clientId, rewardText);
+  };
 
   // ─── CSV export via shareService ───
   const exportCSV = () => {
@@ -2265,23 +2305,46 @@ function GinailsVIPApp({ config }: { config?: VIPModuleConfig } = {}) {
                     <Plus size={18} /> Marcar nueva visita
                   </button>
                 ) : (
-                  <button
-                    onClick={() => toggleRewardClaimed(activeClient.id)}
-                    className="col-span-2 py-4 rounded-2xl font-medium tracking-wide flex items-center justify-center gap-2 transition-all hover:scale-[1.02] active:scale-95"
-                    style={{
-                      background: activeClient.rewardClaimed
-                        ? (dark ? 'rgba(255,255,255,0.08)' : 'rgba(0,0,0,0.06)')
-                        : 'linear-gradient(135deg, #D4AF7F 0%, #C98AA0 100%)',
-                      color: activeClient.rewardClaimed ? 'inherit' : '#fff',
-                      boxShadow: activeClient.rewardClaimed ? 'none' : '0 10px 30px rgba(201,138,160,0.4)',
-                    }}
-                  >
-                    {activeClient.rewardClaimed ? (
-                      <><CheckCircle2 size={18} /> Premio entregado</>
-                    ) : (
-                      <><Gift size={18} /> Marcar premio entregado</>
+                  <>
+                    <button
+                      onClick={() => toggleRewardClaimed(activeClient.id)}
+                      className="col-span-2 py-4 rounded-2xl font-medium tracking-wide flex items-center justify-center gap-2 transition-all hover:scale-[1.02] active:scale-95"
+                      style={{
+                        background: activeClient.rewardClaimed
+                          ? (dark ? 'rgba(255,255,255,0.08)' : 'rgba(0,0,0,0.06)')
+                          : 'linear-gradient(135deg, #D4AF7F 0%, #C98AA0 100%)',
+                        color: activeClient.rewardClaimed ? 'inherit' : '#fff',
+                        boxShadow: activeClient.rewardClaimed ? 'none' : '0 10px 30px rgba(201,138,160,0.4)',
+                      }}
+                    >
+                      {activeClient.rewardClaimed ? (
+                        <><CheckCircle2 size={18} /> Premio entregado ✓</>
+                      ) : (
+                        <><Gift size={18} /> Marcar premio entregado</>
+                      )}
+                    </button>
+
+                    {/* Botón Nuevo ciclo — solo visible cuando el premio ya fue entregado */}
+                    {activeClient.rewardClaimed && (
+                      <button
+                        onClick={() => askConfirm({
+                          title: '¿Iniciar nuevo ciclo?',
+                          message: `Se guardará el ciclo actual en el historial y la tarjeta de ${activeClient.name} arrancará de cero.`,
+                          confirmLabel: 'Sí, nuevo ciclo',
+                          danger: false,
+                          onConfirm: () => startNewCycle(activeClient.id),
+                        })}
+                        className="col-span-2 py-3 rounded-2xl font-medium tracking-wide flex items-center justify-center gap-2 transition-all hover:scale-[1.02] active:scale-95"
+                        style={{
+                          background: 'linear-gradient(135deg, #D4AF7F 0%, #C98AA0 100%)',
+                          color: '#fff',
+                          boxShadow: '0 8px 24px rgba(201,138,160,0.35)',
+                        }}
+                      >
+                        <Sparkles size={18} /> Iniciar nuevo ciclo
+                      </button>
                     )}
-                  </button>
+                  </>
                 )}
 
                 {activeClient.visits.length < activeClient.goal && (
@@ -2334,6 +2397,47 @@ function GinailsVIPApp({ config }: { config?: VIPModuleConfig } = {}) {
                           <Edit3 size={12} className="opacity-50" />
                         </span>
                       </button>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {/* Historial de ciclos completados */}
+              {activeClient.completedCycles && activeClient.completedCycles.length > 0 && (
+                <div
+                  className="mt-4 rounded-3xl p-5"
+                  style={{
+                    background: dark ? 'rgba(255,255,255,0.04)' : 'rgba(255,255,255,0.7)',
+                    backdropFilter: 'blur(20px)',
+                    border: `1px solid ${dark ? 'rgba(212,175,127,0.15)' : 'rgba(212,175,127,0.25)'}`,
+                  }}
+                >
+                  <div className="text-xs tracking-[0.25em] uppercase opacity-60 mb-3 flex items-center gap-2">
+                    <Trophy size={14} style={{ color: '#D4AF7F' }} /> Historial de premios
+                  </div>
+                  <div className="space-y-2">
+                    {[...activeClient.completedCycles].reverse().map((cycle) => (
+                      <div
+                        key={cycle.cycleNumber}
+                        className="flex items-center gap-3 py-2 px-3 rounded-xl"
+                        style={{ background: dark ? 'rgba(255,255,255,0.03)' : 'rgba(212,175,127,0.06)' }}
+                      >
+                        <div
+                          className="w-8 h-8 rounded-full flex items-center justify-center text-sm flex-shrink-0"
+                          style={{ background: 'linear-gradient(135deg, #D4AF7F 0%, #C98AA0 100%)', color: '#fff' }}
+                        >
+                          {cycle.cycleNumber}
+                        </div>
+                        <div className="flex-1 min-w-0">
+                          <div className="text-sm" style={{ fontFamily: '"Cormorant Garamond", serif', fontStyle: 'italic', fontWeight: 600 }}>
+                            {cycle.rewardText}
+                          </div>
+                          <div className="text-[10px] opacity-60">
+                            {new Date(cycle.completedAt).toLocaleDateString('es-AR', { day: 'numeric', month: 'long', year: 'numeric' })} · {cycle.visitsCount} visitas
+                          </div>
+                        </div>
+                        <Crown size={14} style={{ color: '#D4AF7F', opacity: 0.7, flexShrink: 0 }} />
+                      </div>
                     ))}
                   </div>
                 </div>
