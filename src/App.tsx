@@ -1786,7 +1786,39 @@ function GinailsVIPApp({ config }: { config?: VIPModuleConfig } = {}) {
 
   // CRM derived state
   const crmThresholds = settings.crmThresholds || DEFAULT_CRM_THRESHOLDS;
-  const crmAlerts = useMemo(() => crmService.buildAllAlerts(clients, settings), [clients, settings]);
+
+  // ─── Alertas descartadas — persiste en localStorage ───
+  // Guardamos { [clientId]: timestamp_de_descarte }
+  // Si el timestamp tiene menos de 7 días, la alerta se filtra.
+  const DISMISSED_KEY = 'ginails_vip_dismissed_alerts';
+  const DISMISS_DAYS = 7;
+
+  const [dismissedAlerts, setDismissedAlerts] = useState<Record<string, number>>(() => {
+    try {
+      const raw = localStorage.getItem(DISMISSED_KEY);
+      return raw ? JSON.parse(raw) : {};
+    } catch { return {}; }
+  });
+
+  // Descarta una alerta por 7 días
+  const dismissAlert = (clientId: string) => {
+    setDismissedAlerts(prev => {
+      const next = { ...prev, [clientId]: Date.now() };
+      try { localStorage.setItem(DISMISSED_KEY, JSON.stringify(next)); } catch {}
+      return next;
+    });
+  };
+
+  // Filtra alertas que hayan sido descartadas en los últimos 7 días
+  const allCrmAlerts = useMemo(() => crmService.buildAllAlerts(clients, settings), [clients, settings]);
+  const crmAlerts = useMemo(() => {
+    const cutoff = Date.now() - DISMISS_DAYS * 24 * 60 * 60 * 1000;
+    return allCrmAlerts.filter(a => {
+      const dismissedAt = dismissedAlerts[a.clientId];
+      return !dismissedAt || dismissedAt < cutoff;
+    });
+  }, [allCrmAlerts, dismissedAlerts]);
+
   const crmMetrics = useMemo(() => crmService.metrics(clients, crmThresholds), [clients, crmThresholds]);
   const topByVisits = useMemo(() => crmService.topByVisits(clients, 5), [clients]);
 
@@ -1884,11 +1916,10 @@ function GinailsVIPApp({ config }: { config?: VIPModuleConfig } = {}) {
   };
 
   // ─── WhatsApp share via shareService ───
-const shareWhatsApp = () => {
+  const shareWhatsApp = () => {
     if (!activeClient) return;
     const cfg = settings[activeClient.brand];
-    const publicUrl = `https://ginails-vip.pages.dev/c/${activeClient.tenantId || ''}/${activeClient.id}`;
-    const msg = shareService.cardShareMessage(activeClient, cfg.businessName, cfg.rewardText, publicUrl);
+    const msg = shareService.whatsappMessage(activeClient, cfg.businessName, cfg.rewardText);
     const url = shareService.whatsappUrl(activeClient, msg);
     window.open(url, '_blank');
   };
@@ -2043,6 +2074,7 @@ const shareWhatsApp = () => {
                   dark={dark}
                   onOpenCRM={() => setView('crm')}
                   onOpenClient={(id) => { setActiveClientId(id); setView('detail'); }}
+                  onDismiss={(alert) => dismissAlert(alert.clientId)}
                   onSendWhatsApp={(alert) => {
                     const c = clients.find(cl => cl.id === alert.clientId);
                     if (!c) return;
@@ -2051,6 +2083,7 @@ const shareWhatsApp = () => {
                       ? `https://wa.me/${phone}?text=${encodeURIComponent(alert.whatsappTemplate)}`
                       : `https://wa.me/?text=${encodeURIComponent(alert.whatsappTemplate)}`;
                     window.open(url, '_blank');
+                    dismissAlert(alert.clientId);
                   }}
                 />
               )}
@@ -2465,6 +2498,7 @@ const shareWhatsApp = () => {
                 setSettings(s => ({ ...s, crmThresholds: { ...DEFAULT_CRM_THRESHOLDS, ...(s.crmThresholds || {}), ...patch } }))
               }
               onOpenClient={(id) => { setActiveClientId(id); setView('detail'); }}
+              onDismiss={(alert) => dismissAlert(alert.clientId)}
               onSendWhatsApp={(alert) => {
                 const c = clients.find(cl => cl.id === alert.clientId);
                 if (!c) return;
@@ -2473,6 +2507,7 @@ const shareWhatsApp = () => {
                   ? `https://wa.me/${phone}?text=${encodeURIComponent(alert.whatsappTemplate)}`
                   : `https://wa.me/?text=${encodeURIComponent(alert.whatsappTemplate)}`;
                 window.open(url, '_blank');
+                dismissAlert(alert.clientId);
               }}
             />
           )}
@@ -3174,8 +3209,9 @@ const CRMAlertsStrip: React.FC<{
   dark: boolean;
   onOpenCRM: () => void;
   onOpenClient: (id: string) => void;
+  onDismiss: (alert: CRMAlert) => void;
   onSendWhatsApp: (alert: CRMAlert) => void;
-}> = ({ alerts, clients, totalAlerts, dark, onOpenCRM, onOpenClient, onSendWhatsApp }) => {
+}> = ({ alerts, clients, totalAlerts, dark, onOpenCRM, onOpenClient, onDismiss, onSendWhatsApp }) => {
   const clientById = useMemo(() => {
     const m = new Map<string, Client>();
     clients.forEach(c => m.set(c.id, c));
@@ -3214,6 +3250,7 @@ const CRMAlertsStrip: React.FC<{
               key={alert.clientId + alert.state}
               initial={{ opacity: 0, x: 20 }}
               animate={{ opacity: 1, x: 0 }}
+              exit={{ opacity: 0, scale: 0.9 }}
               transition={{ delay: idx * 0.04 }}
               className="flex-shrink-0 w-[260px] sm:w-[280px] rounded-2xl p-4 snap-start relative overflow-hidden"
               style={{
@@ -3248,6 +3285,15 @@ const CRMAlertsStrip: React.FC<{
                     </div>
                   </button>
                 </div>
+                {/* Botón X — descarta la alerta por 7 días */}
+                <button
+                  onClick={() => onDismiss(alert)}
+                  className="flex-shrink-0 ml-1 w-6 h-6 rounded-full flex items-center justify-center opacity-40 hover:opacity-100 transition-opacity"
+                  style={{ background: dark ? 'rgba(255,255,255,0.08)' : 'rgba(0,0,0,0.05)' }}
+                  title="Descartar por 7 días"
+                >
+                  <X size={11} />
+                </button>
               </div>
               <p className="text-xs opacity-80 leading-snug mb-3 line-clamp-2 min-h-[2.5em]">
                 {alert.reason}
@@ -3282,8 +3328,9 @@ const CRMView: React.FC<{
   dark: boolean;
   onUpdateThresholds: (patch: Partial<CRMThresholds>) => void;
   onOpenClient: (id: string) => void;
+  onDismiss: (alert: CRMAlert) => void;
   onSendWhatsApp: (alert: CRMAlert) => void;
-}> = ({ alerts, metrics, topByVisits, clients, thresholds, dark, onUpdateThresholds, onOpenClient, onSendWhatsApp }) => {
+}> = ({ alerts, metrics, topByVisits, clients, thresholds, dark, onUpdateThresholds, onOpenClient, onDismiss, onSendWhatsApp }) => {
   const clientById = useMemo(() => {
     const m = new Map<string, Client>();
     clients.forEach(c => m.set(c.id, c));
@@ -3436,6 +3483,15 @@ const CRMView: React.FC<{
                         >
                           <MessageCircle size={13} />
                           <span className="hidden sm:inline">WhatsApp</span>
+                        </button>
+                        {/* X — descarta por 7 días */}
+                        <button
+                          onClick={() => onDismiss(alert)}
+                          className="w-7 h-7 rounded-full flex items-center justify-center opacity-40 hover:opacity-100 transition-opacity flex-shrink-0"
+                          style={{ background: dark ? 'rgba(255,255,255,0.08)' : 'rgba(0,0,0,0.05)' }}
+                          title="Descartar por 7 días"
+                        >
+                          <X size={11} />
                         </button>
                       </div>
                     );
